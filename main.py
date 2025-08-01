@@ -1,3 +1,24 @@
+# Read employee to-dos from Odoo hr.employee model
+def get_odoo_employee_todos():
+    # This assumes there is a field like 'todo_ids' or similar on hr.employee
+    employees = odoo_models.execute_kw(
+        config.ODOO_DB, odoo_uid, config.ODOO_PASSWORD,
+        'hr.employee', 'search_read',
+        [[]],
+        {'fields': ['id', 'name', 'activity_ids']}
+    )
+    todos = []
+    for emp in employees:
+        if 'activity_ids' in emp and emp['activity_ids']:
+            # Fetch activity details for each employee
+            activity_details = odoo_models.execute_kw(
+                config.ODOO_DB, odoo_uid, config.ODOO_PASSWORD,
+                'mail.activity', 'read',
+                [emp['activity_ids']],
+                {'fields': ['id', 'summary', 'note']}
+            )
+            todos.extend(activity_details)
+    return todos
 import json
 from urllib.parse import urlencode
 
@@ -32,8 +53,28 @@ def get_google_tasklist_id(access_token):
     return None
 
 def push_task_to_google(access_token, tasklist_id, task):
-    url = f"https://tasks.googleapis.com/tasks/v1/lists/{tasklist_id}/tasks"
+    # Check for existing task with same title (handle pagination)
+    list_url = f"https://tasks.googleapis.com/tasks/v1/lists/{tasklist_id}/tasks"
     headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+    existing_titles = set()
+    page_token = None
+    while True:
+        url = list_url
+        if page_token:
+            url += f"?pageToken={page_token}"
+        get_resp = requests.get(url, headers=headers)
+        if get_resp.status_code != 200:
+            break
+        resp_json = get_resp.json()
+        items = resp_json.get("items", [])
+        for item in items:
+            title = item.get("title", "").strip().lower()
+            existing_titles.add(title)
+        page_token = resp_json.get("nextPageToken")
+        if not page_token:
+            break
+    if task["name"].strip().lower() in existing_titles:
+        return 409, "Task already exists"
     notes = task.get("description", "")
     if not isinstance(notes, str):
         notes = ""
@@ -41,7 +82,7 @@ def push_task_to_google(access_token, tasklist_id, task):
         "title": task["name"],
         "notes": notes
     }
-    response = requests.post(url, headers=headers, json=data)
+    response = requests.post(list_url, headers=headers, json=data)
     return response.status_code, response.text
 import requests
 import xmlrpc.client
@@ -77,6 +118,14 @@ def push_task_to_azure(access_token, task):
     # Use application permissions endpoint
     url = f"https://graph.microsoft.com/v1.0/users/{config.AZURE_USER_ID}/todo/lists/{config.AZURE_TODO_LIST_ID}/tasks"
     headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+    # Check for existing task with same title
+    get_url = url
+    get_resp = requests.get(get_url, headers=headers)
+    if get_resp.status_code == 200:
+        items = get_resp.json().get("value", [])
+        for item in items:
+            if item.get("title", "").strip().lower() == task["name"].strip().lower():
+                return 409, "Task already exists"
     data = {
         "title": task["name"],
         "body": {"content": task.get("description", ""), "contentType": "text"}
@@ -85,23 +134,59 @@ def push_task_to_azure(access_token, task):
     return response.status_code, response.text
 
 def main():
-    print("Reading tasks from Odoo...")
+    # Discover available fields in hr.employee
+    print("Discovering fields in hr.employee...")
+    try:
+        employee_fields = odoo_models.execute_kw(
+            config.ODOO_DB, odoo_uid, config.ODOO_PASSWORD,
+            'hr.employee', 'fields_get',
+            [],
+            {'attributes': ['string', 'help', 'type']}
+        )
+        print("hr.employee fields:")
+        print(list(employee_fields.keys()))
+    except Exception as e:
+        print(f"Error discovering hr.employee fields: {e}")
+    print("Reading tasks from Odoo project.task...")
     tasks = get_odoo_tasks()
-    print(f"Found {len(tasks)} tasks.")
+    print(f"Found {len(tasks)} project tasks.")
+
+    print("Reading employee to-dos from Odoo hr.employee...")
+    employee_todos = get_odoo_employee_todos()
+    print(f"Found {len(employee_todos)} employee to-dos.")
     access_token = get_azure_token()
+    print("\nSyncing project tasks to Azure...")
     for task in tasks:
         status, resp = push_task_to_azure(access_token, task)
-        print(f"Pushed task '{task['name']}': {status}\nResponse: {resp}\n")
+        print(f"Azure: Pushed project task '{task['name']}': {status}\nResponse: {resp}\n")
+
+    print("Syncing employee to-dos to Azure...")
+    for todo in employee_todos:
+        # Use summary for title, note for description
+        emp_task = {
+            "name": todo.get("summary", ""),
+            "description": todo.get("note", "")
+        }
+        status, resp = push_task_to_azure(access_token, emp_task)
+        print(f"Azure: Pushed employee to-do '{emp_task['name']}': {status}\nResponse: {resp}\n")
 
     # Push to Google Tasks
-    print("\nPushing tasks to Google Tasks...")
+    print("\nPushing project tasks to Google Tasks...")
     google_token = get_google_access_token()
     if google_token:
         google_tasklist_id = get_google_tasklist_id(google_token)
         if google_tasklist_id:
             for task in tasks:
                 status, resp = push_task_to_google(google_token, google_tasklist_id, task)
-                print(f"Google: Pushed task '{task['name']}': {status}\nResponse: {resp}\n")
+                print(f"Google: Pushed project task '{task['name']}': {status}\nResponse: {resp}\n")
+            print("Pushing employee to-dos to Google Tasks...")
+            for todo in employee_todos:
+                emp_task = {
+                    "name": todo.get("summary", ""),
+                    "description": todo.get("note", "")
+                }
+                status, resp = push_task_to_google(google_token, google_tasklist_id, emp_task)
+                print(f"Google: Pushed employee to-do '{emp_task['name']}': {status}\nResponse: {resp}\n")
         else:
             print("Could not find Google tasklist.")
     else:
