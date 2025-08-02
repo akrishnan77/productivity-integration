@@ -1,8 +1,62 @@
-# Read employee to-dos from Odoo hr.employee model
+import requests
+import json
+from urllib.parse import urlencode
+
+# --- Odoo JSON-RPC Helper ---
+def odoo_jsonrpc_call(model, method, args=None, kwargs=None):
+    url = f"{config.ODOO_URL}/jsonrpc"
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "call",
+        "params": {
+            "service": "object",
+            "method": "execute_kw",
+            "args": [
+                config.ODOO_DB,
+                odoo_uid,
+                config.ODOO_PASSWORD,
+                model,
+                method,
+                args or [],
+                kwargs or {}
+            ]
+        },
+        "id": 1
+    }
+    resp = requests.post(url, headers=headers, data=json.dumps(payload))
+    resp.raise_for_status()
+    result = resp.json()
+    if 'result' in result:
+        return result['result']
+    else:
+        raise Exception(f"Odoo JSON-RPC error: {result}")
+
+# --- Odoo Authentication (login) ---
+def odoo_login():
+    url = f"{config.ODOO_URL}/jsonrpc"
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "call",
+        "params": {
+            "service": "common",
+            "method": "login",
+            "args": [config.ODOO_DB, config.ODOO_USERNAME, config.ODOO_PASSWORD]
+        },
+        "id": 1
+    }
+    resp = requests.post(url, headers=headers, data=json.dumps(payload))
+    resp.raise_for_status()
+    result = resp.json()
+    if 'result' in result:
+        return result['result']
+    else:
+        raise Exception(f"Odoo login error: {result}")
+
+# Read employee to-dos from Odoo hr.employee model (API)
 def get_odoo_employee_todos():
-    # This assumes there is a field like 'todo_ids' or similar on hr.employee
-    employees = odoo_models.execute_kw(
-        config.ODOO_DB, odoo_uid, config.ODOO_PASSWORD,
+    employees = odoo_jsonrpc_call(
         'hr.employee', 'search_read',
         [[]],
         {'fields': ['id', 'name', 'activity_ids']}
@@ -10,9 +64,7 @@ def get_odoo_employee_todos():
     todos = []
     for emp in employees:
         if 'activity_ids' in emp and emp['activity_ids']:
-            # Fetch activity details for each employee
-            activity_details = odoo_models.execute_kw(
-                config.ODOO_DB, odoo_uid, config.ODOO_PASSWORD,
+            activity_details = odoo_jsonrpc_call(
                 'mail.activity', 'read',
                 [emp['activity_ids']],
                 {'fields': ['id', 'summary', 'note']}
@@ -84,20 +136,17 @@ def push_task_to_google(access_token, tasklist_id, task):
     }
     response = requests.post(list_url, headers=headers, json=data)
     return response.status_code, response.text
-import requests
-import xmlrpc.client
+
 from msal import ConfidentialClientApplication
 import config
 
-# --- Odoo XML-RPC Setup ---
-odoo_common = xmlrpc.client.ServerProxy(f"{config.ODOO_URL}/xmlrpc/2/common")
-odoo_uid = odoo_common.authenticate(config.ODOO_DB, config.ODOO_USERNAME, config.ODOO_PASSWORD, {})
-odoo_models = xmlrpc.client.ServerProxy(f"{config.ODOO_URL}/xmlrpc/2/object")
+
+# --- Odoo API Setup ---
+odoo_uid = odoo_login()
 
 def get_odoo_tasks():
-    # Read tasks from Odoo 'project.task' model
-    tasks = odoo_models.execute_kw(
-        config.ODOO_DB, odoo_uid, config.ODOO_PASSWORD,
+    # Read tasks from Odoo 'project.task' model (API)
+    tasks = odoo_jsonrpc_call(
         'project.task', 'search_read',
         [[]],
         {'fields': ['id', 'name', 'description', 'stage_id']}
@@ -137,8 +186,7 @@ def main():
     # Discover available fields in hr.employee
     print("Discovering fields in hr.employee...")
     try:
-        employee_fields = odoo_models.execute_kw(
-            config.ODOO_DB, odoo_uid, config.ODOO_PASSWORD,
+        employee_fields = odoo_jsonrpc_call(
             'hr.employee', 'fields_get',
             [],
             {'attributes': ['string', 'help', 'type']}
