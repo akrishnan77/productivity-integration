@@ -1,36 +1,194 @@
-import requests
-import json
-from urllib.parse import urlencode
-
-# --- Odoo JSON-RPC Helper ---
-def odoo_jsonrpc_call(model, method, args=None, kwargs=None):
-    url = f"{config.ODOO_URL}/jsonrpc"
+# Fetch all models with planned activities (activity_ids) and sync their activities as Google Tasks
+def get_all_model_activities():
+    # Find all models with activity_ids field
+    models = odoo_session.api_call(
+        'ir.model.fields', 'search_read',
+        [[['name', '=', 'activity_ids']]],
+        {'fields': ['model']}
+    )
+    model_names = [m['model'] for m in models]
+    print("\nModels with planned activity or todo:")
+    for m in model_names:
+        print(f" - {m}")
+    # Fetch all activities for each model
+    all_activities = []
+    for model in model_names:
+        try:
+            records = odoo_session.api_call(
+                model, 'search_read',
+                [[['activity_ids', '!=', False]]],
+                {'fields': ['id', 'name', 'activity_ids']}
+            )
+        except Exception as e:
+            print(f"[WARNING] Skipping model '{model}' due to error: {e}")
+            continue
+        for rec in records:
+            if rec.get('activity_ids'):
+                try:
+                    activity_details = odoo_session.api_call(
+                        'mail.activity', 'read',
+                        [rec['activity_ids']],
+                        {'fields': ['id', 'summary', 'note', 'res_model', 'res_id']}
+                    )
+                except Exception as e:
+                    print(f"[WARNING] Skipping activity_ids in model '{model}' record {rec.get('id')} due to error: {e}")
+                    continue
+                for act in activity_details:
+                    desc = act.get('note', '')
+                    if not isinstance(desc, str):
+                        desc = ''
+                    desc = f"Model: {act.get('res_model', '')} | Record ID: {act.get('res_id', '')}\n" + desc
+                    all_activities.append({
+                        "name": act.get("summary", "Planned Activity"),
+                        "description": desc
+                    })
+    print(f"\nTotal planned activities found across all models: {len(all_activities)}")
+    return all_activities
+# Fetch inventory products from Odoo and format as tasks
+def get_inventory_product_tasks():
+    # Fetch products using Odoo's REST-like API endpoint
+    url = f"{config.ODOO_URL}/web/dataset/call_kw/product.product/search_read"
     headers = {"Content-Type": "application/json"}
     payload = {
         "jsonrpc": "2.0",
         "method": "call",
         "params": {
-            "service": "object",
-            "method": "execute_kw",
-            "args": [
-                config.ODOO_DB,
-                odoo_uid,
-                config.ODOO_PASSWORD,
-                model,
-                method,
-                args or [],
-                kwargs or {}
-            ]
+            "model": "product.products",
+            "method": "search_read",
+            "args": [[['type', '=', 'product']]],
+            "kwargs": {
+                "fields": ['id', 'name', 'default_code', 'qty_available', 'lst_price', 'categ_id']
+            }
         },
-        "id": 1
+        "id": 1,
     }
-    resp = requests.post(url, headers=headers, data=json.dumps(payload))
+    # Authenticate using basic auth (if Odoo allows) or session cookie
+    # Here, use basic auth with username/password from config
+    from requests.auth import HTTPBasicAuth
+    resp = requests.post(url, headers=headers, data=json.dumps(payload), auth=HTTPBasicAuth(config.ODOO_USERNAME, config.ODOO_PASSWORD))
     resp.raise_for_status()
     result = resp.json()
-    if 'result' in result:
-        return result['result']
-    else:
-        raise Exception(f"Odoo JSON-RPC error: {result}")
+    products = result.get('result', [])
+    print(f"Fetched {len(products)} inventory products from Odoo:")
+    tasks = []
+    for prod in products:
+        desc = f"Qty Available: {prod.get('qty_available', 0)}\nPrice: {prod.get('lst_price', 0)}"
+        if prod.get('default_code'):
+            desc += f"\nProduct Code: {prod['default_code']}"
+        if prod.get('categ_id') and isinstance(prod['categ_id'], (list, tuple)) and len(prod['categ_id']) > 1:
+            desc += f"\nCategory: {prod['categ_id'][1]}"
+        print(f"  - {prod.get('name', 'Inventory Product')} | {desc.replace(chr(10), ' | ')}")
+        tasks.append({
+            "name": prod.get("name", "Inventory Product"),
+            "description": desc
+        })
+    return tasks
+odoo_uid = None
+# Read project tasks from Odoo project.task model (API)
+def get_odoo_tasks():
+    tasks = odoo_session.api_call(
+        'project.task', 'search_read',
+        [[]],
+        {'fields': ['id', 'name', 'description', 'stage_id']}
+    )
+    # Format for Google Tasks: use name as title, description as notes
+    formatted_tasks = []
+    for t in tasks:
+        desc = t.get('description', '')
+        if not isinstance(desc, str):
+            desc = ''
+        formatted_tasks.append({
+            "name": t.get("name", "Project Task"),
+            "description": desc
+        })
+    return formatted_tasks
+import config
+# Read planned maintenance activities from Odoo maintenance.request (API)
+def get_odoo_maintenance_activities():
+    # Only fetch requests with a planned date in the future
+    from datetime import datetime, timezone
+    today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    # domain: [('schedule_date', '>=', today)]
+    activities = odoo_session.api_call(
+        'maintenance.request', 'search_read',
+        [[['schedule_date', '>=', today]]],
+        {'fields': ['id', 'name', 'schedule_date', 'description', 'category_id', 'equipment_id']}
+    )
+    # Format for Google Tasks: use name as title, description as notes
+    tasks = []
+    for act in activities:
+        desc = act.get('description', '')
+        if not isinstance(desc, str):
+            desc = ''
+        cat = act.get('category_id')
+        # Ignore Equipment field, only use desc (and optionally category/planned date)
+        if cat and isinstance(cat, (list, tuple)) and len(cat) > 1:
+            if isinstance(cat[1], str) and not isinstance(cat[1], bool) and cat[1]:
+                desc = f"Category: {cat[1]}\n" + desc
+            elif cat[1]:
+                print(f"[DEBUG] Unexpected category_id value: {cat[1]} (type: {type(cat[1])})")
+        if act.get('schedule_date'):
+            desc = f"Planned: {act['schedule_date']}\n" + desc
+        tasks.append({"name": act.get("name", "Maintenance Activity"), "description": desc})
+    return tasks
+import requests
+import json
+from urllib.parse import urlencode
+
+# --- Odoo Session Auth Helper ---
+class OdooSession:
+    def __init__(self, url, db, username, password):
+        self.url = url
+        self.db = db
+        self.username = username
+        self.password = password
+        self.session = requests.Session()
+        self.authenticated = False
+
+    def authenticate(self):
+        auth_url = f"{self.url}/web/session/authenticate"
+        headers = {"Content-Type": "application/json"}
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "call",
+            "params": {
+                "db": self.db,
+                "login": self.username,
+                "password": self.password
+            },
+            "id": 1
+        }
+        resp = self.session.post(auth_url, headers=headers, data=json.dumps(payload))
+        resp.raise_for_status()
+        result = resp.json()
+        if 'result' in result and result['result'].get('uid'):
+            self.authenticated = True
+        else:
+            raise Exception(f"Odoo session authentication failed: {result}")
+
+    def api_call(self, model, method, args=None, kwargs=None):
+        if not self.authenticated:
+            self.authenticate()
+        url = f"{self.url}/web/dataset/call_kw/{model}/{method}"
+        headers = {"Content-Type": "application/json"}
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "call",
+            "params": {
+                "model": model,
+                "method": method,
+                "args": args or [],
+                "kwargs": kwargs or {}
+            },
+            "id": 1
+        }
+        resp = self.session.post(url, headers=headers, data=json.dumps(payload))
+        resp.raise_for_status()
+        result = resp.json()
+        if 'result' in result:
+            return result['result']
+        else:
+            raise Exception(f"Odoo API error: {result}")
 
 # --- Odoo Authentication (login) ---
 def odoo_login():
@@ -56,7 +214,7 @@ def odoo_login():
 
 # Read employee to-dos from Odoo hr.employee model (API)
 def get_odoo_employee_todos():
-    employees = odoo_jsonrpc_call(
+    employees = odoo_session.api_call(
         'hr.employee', 'search_read',
         [[]],
         {'fields': ['id', 'name', 'activity_ids']}
@@ -64,7 +222,7 @@ def get_odoo_employee_todos():
     todos = []
     for emp in employees:
         if 'activity_ids' in emp and emp['activity_ids']:
-            activity_details = odoo_jsonrpc_call(
+            activity_details = odoo_session.api_call(
                 'mail.activity', 'read',
                 [emp['activity_ids']],
                 {'fields': ['id', 'summary', 'note']}
@@ -137,104 +295,23 @@ def push_task_to_google(access_token, tasklist_id, task):
     response = requests.post(list_url, headers=headers, json=data)
     return response.status_code, response.text
 
-from msal import ConfidentialClientApplication
-import config
 
-
-# --- Odoo API Setup ---
-odoo_uid = odoo_login()
-
-def get_odoo_tasks():
-    # Read tasks from Odoo 'project.task' model (API)
-    tasks = odoo_jsonrpc_call(
-        'project.task', 'search_read',
-        [[]],
-        {'fields': ['id', 'name', 'description', 'stage_id']}
-    )
-    return tasks
-
-# --- Azure Graph API Setup ---
-def get_azure_token():
-    app = ConfidentialClientApplication(
-        config.AZURE_CLIENT_ID,
-        authority=f"https://login.microsoftonline.com/{config.AZURE_TENANT_ID}",
-        client_credential=config.AZURE_CLIENT_SECRET
-    )
-    token = app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
-    return token.get("access_token")
-
-def push_task_to_azure(access_token, task):
-    # Use application permissions endpoint
-    url = f"https://graph.microsoft.com/v1.0/users/{config.AZURE_USER_ID}/todo/lists/{config.AZURE_TODO_LIST_ID}/tasks"
-    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
-    # Check for existing task with same title
-    get_url = url
-    get_resp = requests.get(get_url, headers=headers)
-    if get_resp.status_code == 200:
-        items = get_resp.json().get("value", [])
-        for item in items:
-            if item.get("title", "").strip().lower() == task["name"].strip().lower():
-                return 409, "Task already exists"
-    data = {
-        "title": task["name"],
-        "body": {"content": task.get("description", ""), "contentType": "text"}
-    }
-    response = requests.post(url, headers=headers, json=data)
-    return response.status_code, response.text
 
 def main():
-    # Discover available fields in hr.employee
-    print("Discovering fields in hr.employee...")
-    try:
-        employee_fields = odoo_jsonrpc_call(
-            'hr.employee', 'fields_get',
-            [],
-            {'attributes': ['string', 'help', 'type']}
-        )
-        print("hr.employee fields:")
-        print(list(employee_fields.keys()))
-    except Exception as e:
-        print(f"Error discovering hr.employee fields: {e}")
-    print("Reading tasks from Odoo project.task...")
-    tasks = get_odoo_tasks()
-    print(f"Found {len(tasks)} project tasks.")
-
-    print("Reading employee to-dos from Odoo hr.employee...")
-    employee_todos = get_odoo_employee_todos()
-    print(f"Found {len(employee_todos)} employee to-dos.")
-    access_token = get_azure_token()
-    print("\nSyncing project tasks to Azure...")
-    for task in tasks:
-        status, resp = push_task_to_azure(access_token, task)
-        print(f"Azure: Pushed project task '{task['name']}': {status}\nResponse: {resp}\n")
-
-    print("Syncing employee to-dos to Azure...")
-    for todo in employee_todos:
-        # Use summary for title, note for description
-        emp_task = {
-            "name": todo.get("summary", ""),
-            "description": todo.get("note", "")
-        }
-        status, resp = push_task_to_azure(access_token, emp_task)
-        print(f"Azure: Pushed employee to-do '{emp_task['name']}': {status}\nResponse: {resp}\n")
+    global odoo_session
+    odoo_session = OdooSession(config.ODOO_URL, config.ODOO_DB, config.ODOO_USERNAME, config.ODOO_PASSWORD)
+    odoo_session.authenticate()
 
     # Push to Google Tasks
-    print("\nPushing project tasks to Google Tasks...")
+    print("\nPushing all planned activities from all models to Google Tasks...")
     google_token = get_google_access_token()
     if google_token:
         google_tasklist_id = get_google_tasklist_id(google_token)
         if google_tasklist_id:
-            for task in tasks:
-                status, resp = push_task_to_google(google_token, google_tasklist_id, task)
-                print(f"Google: Pushed project task '{task['name']}': {status}\nResponse: {resp}\n")
-            print("Pushing employee to-dos to Google Tasks...")
-            for todo in employee_todos:
-                emp_task = {
-                    "name": todo.get("summary", ""),
-                    "description": todo.get("note", "")
-                }
-                status, resp = push_task_to_google(google_token, google_tasklist_id, emp_task)
-                print(f"Google: Pushed employee to-do '{emp_task['name']}': {status}\nResponse: {resp}\n")
+            all_activities = get_all_model_activities()
+            for act in all_activities:
+                status, resp = push_task_to_google(google_token, google_tasklist_id, act)
+                print(f"Google: Pushed planned activity '{act['name']}': {status}\nResponse: {resp}\n")
         else:
             print("Could not find Google tasklist.")
     else:
