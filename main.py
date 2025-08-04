@@ -7,9 +7,6 @@ def get_all_model_activities():
         {'fields': ['model']}
     )
     model_names = [m['model'] for m in models]
-    print("\nModels with planned activity or todo:")
-    for m in model_names:
-        print(f" - {m}")
     # Fetch all activities for each model
     all_activities = []
     for model in model_names:
@@ -20,7 +17,7 @@ def get_all_model_activities():
                 {'fields': ['id', 'name', 'activity_ids']}
             )
         except Exception as e:
-            print(f"[WARNING] Skipping model '{model}' due to error: {e}")
+            print(f"[ERROR] Skipping model '{model}' due to error: {e}")
             continue
         for rec in records:
             if rec.get('activity_ids'):
@@ -31,7 +28,7 @@ def get_all_model_activities():
                         {'fields': ['id', 'summary', 'note', 'res_model', 'res_id']}
                     )
                 except Exception as e:
-                    print(f"[WARNING] Skipping activity_ids in model '{model}' record {rec.get('id')} due to error: {e}")
+                    print(f"[ERROR] Skipping activity_ids in model '{model}' record {rec.get('id')} due to error: {e}")
                     continue
                 for act in activity_details:
                     desc = act.get('note', '')
@@ -42,7 +39,6 @@ def get_all_model_activities():
                         "name": act.get("summary", "Planned Activity"),
                         "description": desc
                     })
-    print(f"\nTotal planned activities found across all models: {len(all_activities)}")
     return all_activities
 # Fetch inventory products from Odoo and format as tasks
 def get_inventory_product_tasks():
@@ -69,7 +65,6 @@ def get_inventory_product_tasks():
     resp.raise_for_status()
     result = resp.json()
     products = result.get('result', [])
-    print(f"Fetched {len(products)} inventory products from Odoo:")
     tasks = []
     for prod in products:
         desc = f"Qty Available: {prod.get('qty_available', 0)}\nPrice: {prod.get('lst_price', 0)}"
@@ -77,7 +72,6 @@ def get_inventory_product_tasks():
             desc += f"\nProduct Code: {prod['default_code']}"
         if prod.get('categ_id') and isinstance(prod['categ_id'], (list, tuple)) and len(prod['categ_id']) > 1:
             desc += f"\nCategory: {prod['categ_id'][1]}"
-        print(f"  - {prod.get('name', 'Inventory Product')} | {desc.replace(chr(10), ' | ')}")
         tasks.append({
             "name": prod.get("name", "Inventory Product"),
             "description": desc
@@ -288,6 +282,8 @@ def push_task_to_google(access_token, tasklist_id, task):
     notes = task.get("description", "")
     if not isinstance(notes, str):
         notes = ""
+    # Prepend 'ODOO' to the description
+    notes = f"ODOO {notes}" if notes else "ODOO"
     data = {
         "title": task["name"],
         "notes": notes
@@ -303,19 +299,13 @@ def main():
     odoo_session.authenticate()
 
     # Push to Google Tasks
-    print("\nPushing all planned activities from all models to Google Tasks...")
     google_token = get_google_access_token()
     if google_token:
         google_tasklist_id = get_google_tasklist_id(google_token)
         if google_tasklist_id:
             all_activities = get_all_model_activities()
             for act in all_activities:
-                status, resp = push_task_to_google(google_token, google_tasklist_id, act)
-                print(f"Google: Pushed planned activity '{act['name']}': {status}\nResponse: {resp}\n")
-        else:
-            print("Could not find Google tasklist.")
-    else:
-        print("Could not get Google access token.")
+                push_task_to_google(google_token, google_tasklist_id, act)
 
 if __name__ == "__main__":
     main()
